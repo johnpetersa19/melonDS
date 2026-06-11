@@ -263,9 +263,103 @@ void A_MRC(ARM* cpu)
 }
 
 
+// HLE BIOS SWI interception — CpuFastSet (0x0B) and CpuSet (0x0C)
+// Intercepts the two most frequently called NDS BIOS syscalls and executes
+// them as native C++ instead of running ~200-400 ARM instructions in the BIOS.
+static bool TryHLE_SVC(ARM* cpu, u32 swinum)
+{
+    // SWI 0x0B — CpuFastSet
+    // R0 = src, R1 = dst, R2 = (fill << 24) | word_count
+    if (swinum == 0x0B)
+    {
+        u32 src  = cpu->R[0] & ~3U;
+        u32 dst  = cpu->R[1] & ~3U;
+        u32 cnt  = cpu->R[2] & 0x1FFFFF;
+        bool fill = (cpu->R[2] >> 24) & 1;
+
+        if (fill)
+        {
+            u32 val;
+            cpu->DataRead32(src, &val);
+            for (u32 i = 0; i < cnt; i++)
+                cpu->DataWrite32(dst + i * 4, val);
+        }
+        else
+        {
+            for (u32 i = 0; i < cnt; i++)
+            {
+                u32 val;
+                cpu->DataRead32(src + i * 4, &val);
+                cpu->DataWrite32(dst + i * 4, val);
+            }
+        }
+        cpu->JumpTo(cpu->R[14]);
+        return true;
+    }
+
+    // SWI 0x0C — CpuSet
+    // R0 = src, R1 = dst, R2 = (fill << 24) | (wide << 26) | count
+    if (swinum == 0x0C)
+    {
+        u32 src   = cpu->R[0];
+        u32 dst   = cpu->R[1];
+        u32 cnt   = cpu->R[2] & 0x1FFFFF;
+        bool fill = (cpu->R[2] >> 24) & 1;
+        bool wide = (cpu->R[2] >> 26) & 1;
+
+        if (wide) // 32-bit mode
+        {
+            src &= ~3U;
+            dst &= ~3U;
+            if (fill)
+            {
+                u32 val;
+                cpu->DataRead32(src, &val);
+                for (u32 i = 0; i < cnt; i++)
+                    cpu->DataWrite32(dst + i * 4, val);
+            }
+            else
+            {
+                for (u32 i = 0; i < cnt; i++)
+                {
+                    u32 val;
+                    cpu->DataRead32(src + i * 4, &val);
+                    cpu->DataWrite32(dst + i * 4, val);
+                }
+            }
+        }
+        else // 16-bit mode
+        {
+            src &= ~1U;
+            dst &= ~1U;
+            if (fill)
+            {
+                u32 val;
+                cpu->DataRead16(src, &val);
+                for (u32 i = 0; i < cnt; i++)
+                    cpu->DataWrite16(dst + i * 2, (u16)val);
+            }
+            else
+            {
+                for (u32 i = 0; i < cnt; i++)
+                {
+                    u32 val;
+                    cpu->DataRead16(src + i * 2, &val);
+                    cpu->DataWrite16(dst + i * 2, (u16)val);
+                }
+            }
+        }
+        cpu->JumpTo(cpu->R[14]);
+        return true;
+    }
+
+    return false;
+}
 
 void A_SVC(ARM* cpu)
 {
+    if (TryHLE_SVC(cpu, cpu->CurInstr & 0xFFFFFF)) return;
+
     u32 oldcpsr = cpu->CPSR;
     cpu->CPSR &= ~0xBF;
     cpu->CPSR |= 0x93;
@@ -278,6 +372,8 @@ void A_SVC(ARM* cpu)
 
 void T_SVC(ARM* cpu)
 {
+    if (TryHLE_SVC(cpu, cpu->CurInstr & 0xFF)) return;
+
     u32 oldcpsr = cpu->CPSR;
     cpu->CPSR &= ~0xBF;
     cpu->CPSR |= 0x93;
